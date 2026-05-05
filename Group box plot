@@ -1,0 +1,117 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.patches as mpatches
+
+# --- Configuration ---
+OPTIMAL_OBJ_VALUE = 44014.68
+FILE_MAPPING = {
+    'Archetype Analysis': 'aa_aro_results (4).csv',
+    'K-Means': 'kmeans_aro_results (3).csv',
+    'K-Medoids': 'kmedoids_aro_results.csv',
+    'K-Modes': 'kmodes_aro_results.csv',
+    'Monte Carlo': 'montecarlo_aro_results.csv'
+}
+
+CUSTOM_PALETTE = {
+    'Archetype Analysis': '#1f77b4',
+    'K-Means': '#ff7f0e',
+    'K-Medoids': '#2ca02c',
+    'K-Modes': '#d62728',
+    'Monte Carlo': '#9467bd'
+}
+
+# Define consistent order for methods to ensure x-axis alignment
+METHOD_ORDER = ['Archetype Analysis', 'K-Means', 'K-Medoids', 'K-Modes', 'Monte Carlo']
+
+def load_data(file_map):
+    """Loads data and calculates the positive optimality gap (0-100%)."""
+    all_dfs = []
+    for method, file_path in file_map.items():
+        try:
+            df = pd.read_csv(file_path)
+            df['method'] = method
+            # (Optimal - Objective) / Optimal * 100
+            df['optimality_gap'] = ((OPTIMAL_OBJ_VALUE - df['obj_value']) / OPTIMAL_OBJ_VALUE) * 100
+            all_dfs.append(df)
+        except FileNotFoundError:
+            print(f"Warning: {file_path} not found.")
+            continue
+    if not all_dfs:
+        raise ValueError("No data loaded.")
+    return pd.concat(all_dfs, ignore_index=True)
+
+def plot_square_faceted_boxplot(df):
+    """Generates a more square-like faceted boxplot (3 columns) with labels on all subplots."""
+    
+    # 1. Update font size
+    plt.rcParams.update({'font.size': 14})
+    
+    # 2. Create the FacetGrid
+    # col_wrap=3 creates a 3-column layout (approx 3x4 grid for 10 items) which is closer to a square
+    # sharex=False is CRITICAL: It ensures x-axis labels/ticks are not hidden for 'inner' plots
+    g = sns.catplot(
+        data=df, 
+        x='method', 
+        y='optimality_gap', 
+        col='k', 
+        kind='box',
+        col_wrap=4,           # square aspect ratio
+        palette=CUSTOM_PALETTE,
+        height=3.5,           # Height of each subplot
+        aspect=1,             # Square subplots
+        sharey=True,          # Share Y-axis
+        sharex=False,         # Forces x-labels to appear on all rows
+        legend=False,         # Disable default side legend
+        linewidth=1.2,
+        fliersize=3,
+        order=METHOD_ORDER    # Ensure same order since sharex=False
+    )
+    
+    # 3. Customizing Axes
+    g.set_axis_labels("", "Optimality Gap (%)")
+    g.set(ylim=(-5, 105))
+    
+    # 4. Iterate over all axes to set the 'k=' label
+    unique_ks = sorted(df['k'].unique())
+    
+    for i, ax in enumerate(g.axes.flat):
+        if i < len(unique_ks):
+            ax.set_title("") # Remove top title
+            
+            k_val = unique_ks[i]
+            # Set label at bottom of each subplot
+            ax.set_xlabel(f"$k = {k_val}$", fontsize=14, labelpad=10)
+            
+            # Remove method names from x-ticks
+            ax.set_xticklabels([])
+            ax.tick_params(axis='x', length=0)
+        else:
+            ax.set_visible(False) # Hide empty slots
+
+    # 5. Add Custom Legend at the Bottom
+    legend_handles = [mpatches.Patch(color=color, label=label) for label, color in CUSTOM_PALETTE.items()]
+    
+    g.fig.legend(
+        handles=legend_handles, 
+        loc='lower center', 
+        bbox_to_anchor=(0.5, 0.0), 
+        ncol=5, 
+        frameon=False, 
+        fontsize=14
+    )
+    
+    # 6. Adjust Layout
+    # hspace needs to be enough for the 'k=...' labels
+    plt.subplots_adjust(bottom=0.08, hspace=0.4, wspace=0.1)
+    
+    plt.savefig('figure_faceted_boxplot.pdf', dpi=300, bbox_inches='tight')
+    print("Saved Figure: Faceted Boxplot")
+    plt.close()
+
+if __name__ == '__main__':
+    try:
+        combined_df = load_data(FILE_MAPPING)
+        plot_square_faceted_boxplot(combined_df)
+    except Exception as e:
+        print(f"Error: {e}")
