@@ -1,0 +1,170 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+
+# --- Configuration ---
+plt.style.use('seaborn-v0_8-paper')
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 16,             
+    "axes.titlesize": 16,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 14,
+})
+
+# --- 1. File Paths (5 Scenarios Only) ---
+SCENARIO_PATHS = {
+    '(a) Archetype Analysis': 'beta_chosen_Bernoulli_archetype_scenarios_k50.csv',
+    '(b) K-Means': 'kmeans_selected.csv',
+    '(c) K-Medoids': 'kmedoids_selected.csv',     
+    '(d) K-Modes': 'kmodes_selected.csv',         
+    '(e) Monte Carlo': 'monte_carlo_selected.csv'
+}
+
+NETWORK_COORDS = {
+    'Power': 'PowerNodes.csv',
+    'Water': 'WaterNodes.csv',
+    'Gas': 'GasNodes.csv',
+    'Telecommunication': 'TelecommunicationNodes.csv'
+}
+
+# --- 2. Helper Functions ---
+def load_all_coordinates(network_files):
+    """Load coordinates for all nodes."""
+    all_coords = {}
+    for network_type, filepath in network_files.items():
+        try:
+            df = pd.read_csv(filepath)
+            for idx, row in df.iterrows():
+                component_name = f"{network_type}_Node_{idx}"
+                all_coords[component_name] = (row['X'], row['Y'])
+        except FileNotFoundError:
+            print(f"⚠ Warning: {filepath} not found")
+    return all_coords
+
+def calculate_node_damage_frequency(filepath):
+    """Calculate simple damage frequency (Mean of 0s and 1s)."""
+    try:
+        df = pd.read_csv(filepath)
+        # Filter for Node columns only
+        node_columns = [col for col in df.columns if 'Node' in col and col not in ['Scenario_ID', 'id', 'index']]
+        if not node_columns:
+            return pd.Series(dtype=float)
+        return df[node_columns].mean()
+    except FileNotFoundError:
+        print(f"⚠ Warning: Scenario file '{filepath}' not found")
+        return pd.Series(dtype=float)
+
+def get_component_type(comp_name):
+    for net in ['Power', 'Water', 'Gas', 'Telecommunication']:
+        if net in comp_name: return net
+    return 'Other'
+
+# --- 3. Visualization Function ---
+def plot_damage_heatmap(ax, title, freqs, coords, cmap, norm):
+    markers = {'Power': 'o', 'Water': 's', 'Gas': '^', 'Telecommunication': 'D', 'Other': 'x'}
+    
+    valid_freqs = freqs[freqs.index.isin(coords.keys())]
+    if len(valid_freqs) == 0:
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(title, fontweight='bold', pad=10)
+        return
+    
+    undamaged = valid_freqs[valid_freqs == 0]
+    damaged = valid_freqs[valid_freqs > 0]
+    
+    # 1. Plot Undamaged (Background)
+    for comp_name in undamaged.index:
+        if comp_name in coords:
+            x, y = coords[comp_name]
+            ax.scatter(x, y, s=30, c='lightgray', alpha=0.3, 
+                       marker=markers.get(get_component_type(comp_name), 'o'), 
+                       edgecolors='gray', linewidth=0.3, zorder=1)
+    
+    # 2. Plot Damaged (Heatmap)
+    for comp_name, freq in damaged.items():
+        if comp_name in coords:
+            x, y = coords[comp_name]
+            # Size scaling: 100 is base size, + proportional to frequency
+            size = 100 + (freq * 600)  
+            ax.scatter(x, y, s=size, c=[freq], cmap=cmap, norm=norm,
+                       alpha=0.9, edgecolors='black', linewidth=1.0,
+                       marker=markers.get(get_component_type(comp_name), 'o'), zorder=2)
+    
+    ax.set_title(title, fontweight='bold', pad=10)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.grid(True, linestyle=':', alpha=0.3, zorder=0)
+    ax.set_aspect('equal', adjustable='box')
+
+# --- 4. Main Execution ---
+print("Processing data for 5 selected scenarios...")
+coords = load_all_coordinates(NETWORK_COORDS)
+
+# Calculate frequencies
+all_freq_data = {}
+for title, path in SCENARIO_PATHS.items():
+    all_freq_data[title] = calculate_node_damage_frequency(path)
+
+# Unified Color Scaling (Global Max across all 5 methods)
+global_max = max([f.max() for f in all_freq_data.values() if not f.empty] or [1.0])
+print(f"Global Max Frequency: {global_max:.4f}")
+
+norm = mcolors.Normalize(vmin=0, vmax=global_max)
+cmap = plt.get_cmap('YlOrRd')
+
+# --- 5. Plotting (2 Rows x 3 Columns) ---
+fig = plt.figure(figsize=(20, 12))
+gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.25)
+
+axes = []
+sorted_titles = sorted(SCENARIO_PATHS.keys())
+
+for i, title in enumerate(sorted_titles):
+    freq_series = all_freq_data[title]
+    row, col = divmod(i, 3)
+    ax = fig.add_subplot(gs[row, col])
+    plot_damage_heatmap(ax, title, freq_series, coords, cmap, norm)
+    axes.append(ax)
+
+# Hide the 6th empty slot (Row 1, Column 2)
+ax_empty = fig.add_subplot(gs[1, 2])
+ax_empty.axis('off')
+
+# --- COLORBAR ---
+# Large vertical bar on the right
+cbar_ax = fig.add_axes([0.92, 0.2, 0.02, 0.6]) # [left, bottom, width, height]
+cbar = fig.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=norm), cax=cbar_ax)
+cbar.set_label('Damage Frequency', fontweight='bold', fontsize=16)
+cbar.ax.tick_params(labelsize=14)
+
+# --- LEGEND ---
+legend_elements = [
+    Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=12, label='Power', markeredgecolor='black'),
+    Line2D([0], [0], marker='s', color='w', markerfacecolor='gray', markersize=12, label='Water', markeredgecolor='black'),
+    Line2D([0], [0], marker='^', color='w', markerfacecolor='gray', markersize=12, label='Gas', markeredgecolor='black'),
+    Line2D([0], [0], marker='D', color='w', markerfacecolor='gray', markersize=12, label='Telecom', markeredgecolor='black'),
+]
+
+# Legend at the bottom
+fig.legend(handles=legend_elements, 
+           loc='lower center', 
+           bbox_to_anchor=(0.5, 0.02), 
+           ncol=4, 
+           frameon=True, 
+           edgecolor='black', 
+           borderpad=0.8,
+           fontsize=16)
+
+# Adjust layout
+plt.subplots_adjust(bottom=0.12, right=0.90)
+
+output_filename = 'damage_comparison_5_methods_frequency.pdf'
+plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+print(f"✓ Figure saved: {output_filename}")
+plt.show()
