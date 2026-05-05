@@ -1,0 +1,273 @@
+import pandas as pd
+import gurobipy as gp
+from gurobipy import GRB
+import random
+import math
+import time 
+
+
+def solve_restoration_model_kmeans():
+    """
+    This function formulates and solves the adaptive robust restoration model,
+    now featuring tiered, network-specific deadlines for the fairness constraint.
+    """
+    try:
+        # --- 1. Load and Prepare Data ---
+        print("Loading and preparing data...")
+
+        network_data_sources = {
+            'Power': {'nodes': 'PowerNodes.csv', 'arcs': 'PowerArcs.csv'},
+            'Water': {'nodes': 'WaterNodes.csv', 'arcs': 'WaterArcs.csv'},
+            'Gas': {'nodes': 'GasNodes.csv', 'arcs': 'GasArcs.csv'},
+            'Telecommunication': {'nodes': 'TelecommunicationNodes.csv', 'arcs': 'TelecommunicationArcs.csv'}
+        }
+        
+        network_data = {
+            net: {'nodes': pd.read_csv(files['nodes']), 'arcs': pd.read_csv(files['arcs'])}
+            for net, files in network_data_sources.items()
+        }
+        interdependencies_df = pd.read_csv('Interdep.csv')
+        #damage_matrix_df = pd.read_csv('damage_matrix.csv')
+        damage_matrix_df = pd.read_csv('beta_chosen_Bernoulli_FastSMOAS_scenarios_k25.csv')
+        damage_matrix_df['Scenario_ID'] = [f'KMeans_{i}' for i in range(len(damage_matrix_df))]
+
+        # --- 2. Define Sets and Parameters ---
+        print("Defining model sets and parameters...")
+
+        shift_duration = 8
+        T_max_hours = 168
+        T_max = math.ceil(T_max_hours / shift_duration)
+        T = range(T_max)
+        print(f"Time horizon set to {T_max} shifts of {shift_duration} hours each.")
+
+        C = []
+        source_nodes = set()
+        arc_to_start_node = {}
+        node_to_incoming_arcs = {}
+        component_map_to_damage_name = {}
+
+        D = {}
+        for net, data in network_data.items():
+            for _, row in data['nodes'].iterrows():
+                comp_id = f'{net}_Node_{row["ID"]}'
+                demand_val = row.get('Demand', 0)
+                if demand_val > 0:
+                    D[comp_id] = demand_val
+        C_d = list(D.keys())
+
+        for net, data in network_data.items():
+            node_to_incoming_arcs[net] = {row['ID']: [] for _, row in data['nodes'].iterrows()}
+            for _, row in data['nodes'].iterrows():
+                comp_id = f'{net}_Node_{row["ID"]}'
+                C.append(comp_id)
+                component_map_to_damage_name[comp_id] = comp_id
+                if comp_id not in D:
+                    source_nodes.add(comp_id)
+
+            for _, row in data['arcs'].iterrows():
+                unique_arc_id = f'{net}_Arc_{row["ID"]}'
+                C.append(unique_arc_id)
+                damage_file_arc_name = f'{net}_Arc_{row["Start Node"]}-{row["End Node"]}'
+                component_map_to_damage_name[unique_arc_id] = damage_file_arc_name
+                start_node_id = f'{net}_Node_{row["Start Node"]}'
+                arc_to_start_node[unique_arc_id] = start_node_id
+                if row['End Node'] in node_to_incoming_arcs[net]:
+                    node_to_incoming_arcs[net][row['End Node']].append(unique_arc_id)
+        
+        dependencies = {}
+        for _, row in interdependencies_df.iterrows():
+            depender_id = f"{row['Depender Network']}_Node_{row['Depender Node']}"
+            dependee_id = f"{row['Dependee Network']}_Node_{row['Dependee Node']}"
+            dependencies[depender_id] = dependee_id
+
+        S = damage_matrix_df['Scenario_ID'].tolist()
+
+        print("Defining specialized crew types and compatibility...")
+        networks = list(network_data_sources.keys())
+        K = [f'{net}_{ctype}_Crew' for net in networks for ctype in ['Node', 'Arc']]
+        
+        N_k = {}
+        for k in K:
+            if 'Arc_Crew' in k: N_k[k] = 5
+            else: N_k[k] = 2
+
+        C_ik = {}
+        for c in C:
+            for k in K:
+                comp_net, comp_type, _ = c.split('_', 2)
+                crew_net, crew_type, _ = k.split('_', 2)
+                if comp_net == crew_net and comp_type == crew_type: C_ik[c, k] = 1
+                else: C_ik[c, k] = 0
+
+        print("Estimating repair times (r_i) and costs (Cost_i)...")
+        r, cost = {}, {}
+        notional_cost_per_hour = 100
+        for net, data in network_data.items():
+            for _, row in data['nodes'].iterrows():
+                comp_id, node_type = f'{net}_Node_{row["ID"]}', str(row.get('Node Type', ''))
+                r_hours = 0
+                if net == 'Gas': r_hours = 48 if 'Gate' in node_type else 12
+                elif net == 'Water': r_hours = 36 if 'Pump' in node_type else 24
+                elif net == 'Power': r_hours = 60 if 'Substation' in node_type else 8
+                elif net == 'Telecommunication': r_hours = 48 if 'Central' in node_type else 16
+                cost[comp_id] = r_hours * notional_cost_per_hour
+                r[comp_id] = math.ceil(r_hours / shift_duration)
+
+            for _, row in data['arcs'].iterrows():
+                comp_id = f'{net}_Arc_{row["ID"]}'
+                length = row['Length (km)']
+                r_hours = 0
+                if net == 'Gas': r_hours = 4 + (2 * length)
+                elif net == 'Water': r_hours = 4 + (1.5 * length)
+                elif net == 'Power': r_hours = 2 + (0.5 * length)
+                elif net == 'Telecommunication': r_hours = 3 + (0.25 * length)
+                cost[comp_id] = r_hours * notional_cost_per_hour
+                r[comp_id] = math.ceil(r_hours / shift_duration)
+        
+        damage_matrix_df.set_index('Scenario_ID', inplace=True)
+        damage_cols = set(damage_matrix_df.columns)
+        delta = {}
+        for c in C:
+            damage_name = component_map_to_damage_name.get(c, c)
+            for s in S:
+                delta[c, s] = damage_matrix_df.loc[s, damage_name] if damage_name in damage_cols else 0
+        
+        delta_max = {c: 1 if any(delta[c, s] == 1 for s in S) else 0 for c in C}
+        P = 1.0
+
+        print("Defining fairness constraint parameters...")
+        alpha = 0.9
+        # -----------------------------------------------------------------
+        # --- NEW: Define tiered, network-specific critical deadlines ---
+        # -----------------------------------------------------------------
+        T_critical_by_network = {
+            'Power': math.ceil(72 / shift_duration),  # Tier 1: 48 hours (6 shifts)
+            'Water': math.ceil(72 / shift_duration),  # Tier 1: 48 hours (6 shifts)
+            'Gas': math.ceil(96 / shift_duration),    # Tier 2: 72 hours (9 shifts)
+            'Telecommunication': math.ceil(96 / shift_duration) # Tier 2: 72 hours (9 shifts)
+        }
+        print("Tiered fairness deadlines set:")
+        for net, t_crit in T_critical_by_network.items():
+            print(f"  - {net}: {t_crit*shift_duration} hours (Shift {t_crit})")
+        # -----------------------------------------------------------------
+
+        try:
+            vulnerable_df = pd.read_csv('vulnerable_nodes.csv')
+            V_vulnerable = {net: set() for net in networks}
+            for _, row in vulnerable_df.iterrows():
+                V_vulnerable[row['Network']].add(row['Vulnerable_ID'])
+            print(f"Loaded and categorized {len(vulnerable_df)} vulnerable nodes.")
+        except FileNotFoundError:
+            V_vulnerable = {net: set() for net in networks}
+            print("WARNING: 'vulnerable_nodes.csv' not found.")
+
+        model = gp.Model("ARO_Restoration_Tiered_Fairness")
+
+        print("Defining decision variables...")
+        x = model.addVars(C, T, K, vtype=GRB.BINARY, name="x")
+        y = model.addVars(C, T, S, vtype=GRB.BINARY, name="y")
+        s_vars = model.addVars(C, T, S, vtype=GRB.BINARY, name="s")
+        U_prime = model.addVars(C_d, T, S, vtype=GRB.CONTINUOUS, lb=0, name="U_prime")
+        eta_prime = model.addVar(vtype=GRB.CONTINUOUS, lb=0, name="eta_prime")
+
+        print("Setting objective function...")
+        restoration_cost = gp.quicksum(cost.get(c, 2400) * x[c, t, k] for c in C for t in T for k in K)
+        model.setObjective(restoration_cost + eta_prime, GRB.MINIMIZE)
+
+        print("Defining constraints...")
+        for s in S:
+            model.addConstr(eta_prime >= gp.quicksum(P * U_prime[c, t, s] for c in C_d for t in T))
+        
+        for c in C:
+            model.addConstr(gp.quicksum(x[c, t, k] for t in T for k in K) <= delta_max.get(c, 0))
+
+        for k in K:
+            for t in T:
+                model.addConstr(gp.quicksum(x[c, tau, k] for c in C for tau in range(max(0, t - int(r.get(c, 3)) + 1), t + 1)) <= N_k[k])
+        
+        for c in C:
+            for t in T:
+                for k in K:
+                    if C_ik[c,k] == 0:
+                        model.addConstr(x[c, t, k] == 0)
+
+        for s in S:
+            for t in T:
+                for c in C:
+                    repair_completed = gp.quicksum(x[c, tau, k] for tau in range(t - int(r.get(c, 3)) + 1) if tau >= 0 for k in K)
+                    model.addConstr(s_vars[c, t, s] <= (1 - delta.get((c,s),0)) + repair_completed)
+                    model.addConstr(y[c, t, s] <= s_vars[c, t, s])
+                
+                for arc, start_node in arc_to_start_node.items():
+                    if arc in y and start_node in y:
+                        model.addConstr(y[arc, t, s] <= y[start_node, t, s])
+
+                for net in network_data.keys():
+                    for node_id_num, incoming_arcs in node_to_incoming_arcs[net].items():
+                        node_id = f"{net}_Node_{node_id_num}"
+                        if node_id not in source_nodes and incoming_arcs:
+                            if node_id in y:
+                                model.addConstr(y[node_id, t, s] <= gp.quicksum(y.get((arc, t, s), 0) for arc in incoming_arcs))
+                
+                for depender, dependee in dependencies.items():
+                    if depender in y and dependee in y:
+                        model.addConstr(y[depender, t, s] <= y[dependee, t, s])
+
+                for c in C_d:
+                    model.addConstr(U_prime[c, t, s] >= D[c] * (1 - y.get((c, t, s), 0)))
+        
+        # -----------------------------------------------------------------
+        # --- NEW: Add tiered fairness constraints using a loop ---
+        # -----------------------------------------------------------------
+        print("Adding tiered fairness constraints to the model...")
+        for net, t_critical in T_critical_by_network.items():
+            vulnerable_subset = V_vulnerable[net]
+            if vulnerable_subset: # Only add constraint if there are vulnerable nodes for this network
+                for s in S:
+                    nodes_restored = gp.quicksum(y[v, t_critical, s] for v in vulnerable_subset if v in D)
+                    required_nodes = alpha * len([v for v in vulnerable_subset if v in D])
+                    model.addConstr(nodes_restored >= required_nodes,
+                                    name=f"Fairness_{net}_{s}")
+        # -----------------------------------------------------------------
+        
+        print("\n--- Starting Optimization ---")
+        # --- ADDED: Record start time ---
+        start_time = time.time()
+        
+        model.optimize()
+        
+        # --- ADDED: Record end time ---
+        end_time = time.time()
+        
+
+        if model.status == GRB.OPTIMAL:
+            elapsed_time = end_time - start_time
+            print("\n--- Optimal Solution Found ---")
+            print(f"Objective Value: {model.ObjVal:,.2f}")
+            print(f"Total Restoration Cost: {restoration_cost.getValue():,.2f}")
+            print(f"Worst-Case Unmet Demand Penalty (eta'): {eta_prime.X:,.2f}")
+            print("\nOptimal Repair Schedule (Component, Start Shift):")
+            print(f"Optimization Runtime: {elapsed_time:.2f} seconds")
+            repair_scheduled = False
+            for t in T:
+                for c in C:
+                    if sum(x[c, t, k].X for k in K) > 0.5:
+                        print(f"  - Start repair on component '{c}' at shift t={t}")
+                        repair_scheduled = True
+            if not repair_scheduled: print("  No repair actions scheduled.")
+        elif model.status == GRB.INFEASIBLE:
+            print("\nModel is infeasible. Computing IIS to help debug...")
+            model.computeIIS()
+            model.write("model.ilp")
+            print("Irreducible Inconsistent Subsystem (IIS) written to model.ilp")
+        else:
+            print(f"\nOptimization was stopped with status {model.status}.")
+
+    except FileNotFoundError as e:
+        print(f"Error: A required data file was not found. Please check file paths.")
+        print(e)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    solve_restoration_model_kmeans()
