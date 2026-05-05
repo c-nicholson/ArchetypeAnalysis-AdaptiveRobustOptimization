@@ -1,0 +1,125 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --- Configuration ---
+plt.style.use('seaborn-v0_8-paper')
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 12,
+    "axes.titlesize": 16,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+})
+
+BENCHMARK_OBJECTIVE = 44014.68
+
+METHODS = {
+    'Archetype Analysis': {'file': 'aa_aro_results (5).csv', 'color': '#1f77b4', 'marker': 'o', 'zorder': 5, 'linewidth': 2.5},
+    'K-Means': {'file': 'kmeans_aro_results (3).csv', 'color': '#ff7f0e', 'marker': 's', 'zorder': 3, 'linewidth': 2.0},
+    'K-Modes': {'file': 'kmodes_aro_results.csv', 'color': '#d62728', 'marker': '^', 'zorder': 4, 'linewidth': 2.0},
+    'K-Medoids': {'file': 'kmedoids_aro_results.csv', 'color': '#2ca02c', 'marker': 'D', 'zorder': 2, 'linewidth': 2.0},
+    'Monte Carlo': {'file': 'montecarlo_aro_results.csv', 'color': '#9467bd', 'marker': 'X', 'zorder': 1, 'linewidth': 2.0}
+}
+
+# --- Data Processing ---
+all_points = []
+processed_data = {}
+
+for method_name, config in METHODS.items():
+    try:
+        df = pd.read_csv(config['file'])
+        summary = df.groupby('k').agg(
+            avg_runtime=('runtime', 'mean'),
+            avg_obj_value=('obj_value', 'mean')
+        ).reset_index()
+        summary['optimality_gap'] = abs(((BENCHMARK_OBJECTIVE - summary['avg_obj_value']) / BENCHMARK_OBJECTIVE) * 100)
+        processed_data[method_name] = summary
+    except FileNotFoundError:
+        print(f"Warning: Could not find file {config['file']}")
+
+# --- Visualization ---
+fig, ax = plt.subplots(figsize=(14, 9))
+
+for method_name, summary_df in processed_data.items():
+    config = METHODS[method_name]
+    summary_df = summary_df.sort_values('k')
+    
+    # Main Plot
+    ax.plot(summary_df['avg_runtime'], 
+            summary_df['optimality_gap'],
+            marker=config['marker'],
+            markersize=8,
+            linestyle='-',
+            linewidth=config['linewidth'],
+            color=config['color'],
+            label=method_name,
+            alpha=0.85,
+            zorder=config['zorder'])
+    
+    # --- IMPROVED ANNOTATION LOGIC ---
+    # We iterate with an index 'i' to alternate label positions
+    for i, (_, row) in enumerate(summary_df.iterrows()):
+        
+        # Default offset
+        xy_offset = (0, 10) 
+        
+        # Stagger logic: Even indices go UP, Odd indices go DOWN
+        # This helps separate labels that are horizontally close
+        if i % 2 == 1:
+            xy_offset = (0, -15) # Move text below the point
+        else:
+            xy_offset = (0, 10)  # Move text above the point
+            
+        # Special handling for Archetype Analysis at 0% gap (bottom of chart)
+        # We don't want labels going 'below' 0 too much or they hit the axis
+        if method_name == 'Archetype Analysis' and row['optimality_gap'] < 1.0:
+            if i % 2 == 1:
+                xy_offset = (0, 15)  # Push Up high
+            else:
+                xy_offset = (0, 25)  # Push Up higher
+        
+        ax.annotate(f"k={int(row['k'])}", 
+                   xy=(row['avg_runtime'], row['optimality_gap']),
+                   xytext=xy_offset,
+                   textcoords='offset points',
+                   fontsize=11,
+                   fontweight='bold',
+                   color='black',
+                   ha='center', # Center alignment helps with spacing
+                   va='center')
+
+# --- Formatting ---
+ax.set_xlabel('Average Solution Time (seconds)', fontweight='bold')
+ax.set_ylabel('Average Absolute Optimality Gap (%)', fontweight='bold')
+
+# Legend: Bottom, centered, one line
+ax.legend(
+    loc='upper center', 
+    bbox_to_anchor=(0.5, -0.1),
+    ncol=5,
+    frameon=False, 
+    borderpad=1,
+    handletextpad=0.5,
+    columnspacing=1.5
+)
+
+ax.grid(True, which='both', linestyle=':', linewidth=0.5, alpha=0.6)
+ax.set_axisbelow(True)
+
+# Expand limits slightly
+all_runtimes = [r['avg_runtime'].max() for r in processed_data.values()]
+ax.set_xlim(left=-5, right=max(all_runtimes) * 1.05)
+ax.set_ylim(bottom=-5, top=105)
+
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.spines['left'].set_linewidth(1.5)
+ax.spines['bottom'].set_linewidth(1.5)
+
+plt.subplots_adjust(bottom=0.15)
+plt.savefig('pareto_frontier_clean.pdf', bbox_inches='tight')
+plt.show()
