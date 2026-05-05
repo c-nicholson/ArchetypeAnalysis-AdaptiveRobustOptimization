@@ -1,0 +1,452 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import nnls
+
+
+def furthest_sum(X, k, random_seed=10):
+    """Furthest sum initialization for archetype seeds"""
+    rng = np.random.RandomState(random_seed)
+    idx = rng.randint(0, X.shape[0])
+    indices = [idx]
+    dists = np.sum(np.abs(X - X[idx]), axis=1)
+    for _ in range(k - 1):
+        idx = np.argmax(dists)
+        indices.append(idx)
+        dists = np.minimum(dists, np.sum(np.abs(X - X[idx]), axis=1))
+    return indices
+
+
+def project_to_simplex(v):
+    """Project vector v onto the probability simplex with numerical stability"""
+    v = np.maximum(v, 0)  # Ensure non-negative
+    v_sum = np.sum(v)
+    
+    if v_sum < 1e-10:
+        # All zeros or very small - return uniform
+        return np.ones_like(v) / len(v)
+    
+    result = v / v_sum
+    
+    # Final safety check
+    if not np.isfinite(result).all():
+        return np.ones_like(v) / len(v)
+    
+    return result
+
+
+class AABernoulli_PaperAligned:
+    """
+    Paper-aligned implementation of SMO-AS for Archetypal Analysis of binary data.
+    Based on "Archetypal Analysis for Binary Data" (Wedenborg & Mørup, ICASSP 2025)
+    
+    Key improvements over fast version:
+    1. Proper P matrix construction (eq. 3 in paper)
+    2. Correct Hessian computation for S-update (eq. 7-8)
+    3. Active set procedure for C-update (eq. 11-15)
+    4. Second-order Taylor expansion as described
+    """
+
+    def __init__(self, n_archetypes, max_iter=100, tol=1e-4, random_state=None, 
+                 lr=0.05, epsilon=1e-3):
+        self.n_archetypes = n_archetypes
+        self.max_iter = max_iter
+        self.tol = tol
+        self.lr = lr  # Reduced default learning rate for stability
+        self.epsilon = epsilon  # epsilon for P matrix (paper uses 1e-3)
+        self.random_state = np.random.RandomState(random_state)
+
+    def _initialize(self, X):
+        n, p = X.shape
+        k = self.n_archetypes
+
+        # Furthest sum initialization
+        indices = furthest_sum(X, k, self.random_state.randint(0, 10000))
+        beta = np.zeros((k, n))
+        for i, idx in enumerate(indices):
+            beta[i, idx] = 1
+
+        # Initialize P matrix as per paper: P = X + ε - 2·Xε
+        self.P = X + self.epsilon - 2 * X * self.epsilon
+        
+        Z = beta @ self.P  # archetypes in P-space
+        alpha = np.ones((n, k)) / k
+        return alpha, beta, Z
+
+    def _bernoulli_loss(self, X, R):
+        """Bernoulli cross-entropy loss (eq. 3)"""
+        R = np.clip(R, 1e-10, 1 - 1e-10)
+        return -np.sum(X * np.log(R) + (1 - X) * np.log(1 - R))
+
+    def _compute_s_gradient_hessian(self, X, Z, alpha):
+        """
+        Compute gradient and Hessian for S-update using equations 7-8 from paper
+        
+        Returns:
+            d: gradient vector (n x k)
+            H: Hessian matrices per observation (k x k for each j)
+        """
+        n, p = X.shape
+        k = self.n_archetypes
+        
+        R = alpha @ Z  # reconstruction
+        R = np.clip(R, 1e-10, 1 - 1e-10)
+        
+        # Compute gradient d_{k,j} (eq. 7)
+        d = np.zeros((n, k))
+        H_list = []
+        
+        for j in range(n):
+            # First term: sum over features
+            term1 = np.zeros(k)
+            for i in range(p):
+                coef = (X[j, i] / R[j, i]) - ((1 - X[j, i]) / (1 - R[j, i]))
+                for m in range(p):
+                    term1 += coef * self.P[m, i] * Z[:, m]
+            
+            # Second term: Hessian contribution
+            H_j = np.zeros((k, k))
+            for k_prime in range(k):
+                for k_double_prime in range(k):
+                    h_val = 0
+                    for i in range(p):
+                        coef = (X[j, i] / (R[j, i]**2)) + ((1 - X[j, i]) / ((1 - R[j, i])**2))
+                        for m in range(p):
+                            for m_prime in range(p):
+                                h_val += (coef * self.P[m, i] * Z[k_prime, m] * 
+                                        self.P[m_prime, i] * Z[k_double_prime, m_prime])
+                    H_j[k_prime, k_double_prime] = h_val
+            
+            # Combine for gradient
+            d[j] = term1 - H_j @ alpha[j]
+            H_list.append(H_j)
+        
+        return -d, H_list  # negative because we minimize
+
+    def _s_update_smo(self, X, Z, alpha):
+        """
+        SMO update for S using equations 9-10 from paper
+        Performs K² pairwise updates
+        """
+        n = X.shape[0]
+        k = self.n_archetypes
+        
+        # Compute gradients and Hessians
+        d, H_list = self._compute_s_gradient_hessian(X, Z, alpha)
+        
+        # SMO: iterate over all pairs of archetypes
+        for j in range(n):
+            for k_prime in range(k):
+                for k_double_prime in range(k_prime + 1, k):
+                    # Get current weights for this pair
+                    t_j = alpha[j, k_prime] + alpha[j, k_double_prime]
+                    
+                    if t_j < 1e-10:  # Skip if both weights are essentially zero
+                        continue
+                    
+                    H_j = H_list[j]
+                    
+                    # Compute optimal alpha* using equation 10
+                    numerator = (t_j * H_j[k_prime, k_prime] - 
+                               t_j * H_j[k_double_prime, k_prime] - 
+                               2 * t_j * H_j[k_double_prime, k_prime] + 
+                               2 * t_j * H_j[k_double_prime, k_double_prime] - 
+                               2 * d[j, k_prime] + 
+                               2 * d[j, k_double_prime])
+                    
+                    denominator = (2 * t_j * (H_j[k_prime, k_prime] - 
+                                             H_j[k_prime, k_double_prime] - 
+                                             H_j[k_double_prime, k_prime] + 
+                                             H_j[k_double_prime, k_double_prime]))
+                    
+                    if abs(denominator) > 1e-10:
+                        alpha_star = -numerator / denominator
+                        alpha_star = np.clip(alpha_star, 0, 1)  # Project to [0,1]
+                        
+                        # Update weights
+                        alpha[j, k_prime] = t_j * alpha_star
+                        alpha[j, k_double_prime] = t_j * (1 - alpha_star)
+        
+        # Ensure simplex constraint
+        alpha = np.array([project_to_simplex(a) for a in alpha])
+        return alpha
+
+    def _c_update_active_set(self, X, alpha):
+        """
+        Active set procedure for C-update using equations 11-15 from paper
+        Uses FNNLS with quadratic penalty for simplex constraint
+        """
+        k = self.n_archetypes
+        n, p = X.shape
+        beta = np.zeros((k, n))
+        
+        R = alpha @ (beta @ self.P)  # current reconstruction
+        R = np.clip(R, 1e-10, 1 - 1e-10)
+        
+        for archetype_idx in range(k):
+            # Compute gradient d_{j,k} (eq. 14)
+            d = np.zeros(n)
+            for j in range(n):
+                for i in range(p):
+                    for j_prime in range(p):
+                        coef = (X[j_prime, i] / R[j_prime, i]) - ((1 - X[j_prime, i]) / (1 - R[j_prime, i]))
+                        d[j] += self.P[j, i] * coef * alpha[j_prime, archetype_idx]
+            
+            # Compute Hessian H^(k)_{j',j''} (eq. 15)
+            H = np.zeros((n, n))
+            for j_prime in range(n):
+                for j_double_prime in range(n):
+                    h_val = 0
+                    for i in range(p):
+                        for j_obs in range(p):
+                            coef = (X[j_obs, i] / (R[j_obs, i]**2)) + ((1 - X[j_obs, i]) / ((1 - R[j_obs, i])**2))
+                            h_val += (self.P[j_prime, i] * self.P[j_double_prime, i] * 
+                                    coef * (alpha[j_obs, archetype_idx]**2))
+                    H[j_prime, j_double_prime] = h_val
+            
+            # Add regularization and quadratic penalty (eq. 11)
+            lambda_k = 1e9 * np.mean(H[H > 0]**2) if np.any(H > 0) else 1e3
+            epsilon_k = lambda_k * 1e-15
+            
+            H_reg = H + lambda_k * np.ones((n, n)) + epsilon_k * np.eye(n)
+            d_reg = d + lambda_k * np.ones(n)
+            
+            # Solve with NNLS (active set algorithm)
+            try:
+                beta[archetype_idx], _ = nnls(H_reg, d_reg)
+            except:
+                # Fallback: simple weighted average
+                weights = alpha[:, archetype_idx]
+                if np.sum(weights) > 0:
+                    beta[archetype_idx] = weights / np.sum(weights)
+                else:
+                    beta[archetype_idx] = np.ones(n) / n
+        
+        # Compute archetypes Z = beta @ P
+        Z = beta @ self.P
+        return beta, Z
+
+    def _s_update_gradient(self, X, Z, alpha):
+        """Simpler gradient-based S-update (faster fallback) with numerical stability"""
+        R = alpha @ Z
+        R = np.clip(R, 1e-10, 1 - 1e-10)
+        
+        # Vectorized gradient computation (more stable)
+        # grad[j,k] = sum_i[(X[j,i]/R[j,i] - (1-X[j,i])/(1-R[j,i])) * Z[k,i]]
+        grad = ((X / R) - ((1 - X) / (1 - R))) @ Z.T  # (n x k)
+        
+        # Check for NaN/Inf
+        if np.any(~np.isfinite(grad)):
+            print("Warning: Non-finite gradients detected, using fallback update")
+            # Fallback: small random perturbation
+            alpha = alpha + self.random_state.randn(*alpha.shape) * 1e-6
+        else:
+            # Adaptive learning rate with gradient clipping
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm > 10:  # Clip large gradients
+                grad = grad * (10 / grad_norm)
+            
+            alpha = alpha + self.lr * grad
+        
+        # Project to simplex
+        alpha = np.array([project_to_simplex(a) for a in alpha])
+        
+        # Safety check
+        if np.any(~np.isfinite(alpha)):
+            print("Warning: Non-finite alpha, reinitializing")
+            alpha = np.ones_like(alpha) / alpha.shape[1]
+        
+        return alpha
+
+    def _c_update_simple(self, X, alpha):
+        """Simpler C-update (faster fallback) with numerical stability"""
+        k = self.n_archetypes
+        n = X.shape[0]
+        beta = np.zeros((k, n))
+        
+        for j in range(k):
+            weights = alpha[:, j]
+            weight_sum = np.sum(weights)
+            
+            if weight_sum > 1e-10:
+                beta[j] = weights / weight_sum
+            else:
+                # Uniform fallback
+                beta[j] = np.ones(n) / n
+            
+            # Ensure valid probabilities
+            beta[j] = np.clip(beta[j], 1e-10, 1.0)
+            beta[j] = beta[j] / np.sum(beta[j])
+        
+        Z = beta @ self.P
+        
+        # Clip Z to valid probability range
+        Z = np.clip(Z, self.epsilon, 1 - self.epsilon)
+        
+        return beta, Z
+
+    def fit(self, X, use_full_paper_method=False):
+        """
+        Fit the model
+        
+        Args:
+            X: Binary data matrix (n x p)
+            use_full_paper_method: If True, uses full paper formulations (slower but more accurate)
+                                  If False, uses faster approximations
+        """
+        n, p = X.shape
+        alpha, beta, Z = self._initialize(X)
+        
+        # Compute initial loss with correct R = alpha @ Z
+        R = alpha @ Z
+        loss = self._bernoulli_loss(X, R)
+        
+        print(f"Initial loss: {loss:.4f}")
+        
+        # Track if loss is improving
+        no_improvement_count = 0
+        best_loss = loss
+
+        for it in range(self.max_iter):
+            # S-update
+            if use_full_paper_method:
+                alpha = self._s_update_smo(X, Z, alpha)
+            else:
+                alpha = self._s_update_gradient(X, Z, alpha)
+            
+            # C-update
+            if use_full_paper_method and n < 500:  # Only use full method for smaller datasets
+                beta, Z = self._c_update_active_set(X, alpha)
+            else:
+                beta, Z = self._c_update_simple(X, alpha)
+            
+            # Compute loss
+            R = alpha @ Z
+            new_loss = self._bernoulli_loss(X, R)
+            
+            # Check for NaN
+            if not np.isfinite(new_loss):
+                print(f"⚠️  NaN/Inf loss at iteration {it}, stopping")
+                break
+            
+            # Check convergence
+            if abs(loss - new_loss) < self.tol * abs(loss):
+                print(f"✅ Converged at iteration {it}")
+                break
+            
+            # Track improvement
+            if new_loss < best_loss:
+                best_loss = new_loss
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            
+            # Early stopping if no improvement
+            if no_improvement_count > 20:
+                print(f"⚠️  No improvement for 20 iterations, stopping at iteration {it}")
+                break
+            
+            loss = new_loss
+            
+            if it % 10 == 0:
+                print(f"Iter {it}: loss={loss:.4f}")
+
+        self.alphas_ = alpha
+        self.betas_ = beta
+        self.archetypes_ = Z
+        self.loss_ = loss
+        return self
+
+
+def get_archetype_scenario_ids(file_path='damage_matrix.csv', k=15, random_seed=52, 
+                               n_init=3, use_full_method=False):
+    """
+    Runner: load dataset, fit AA, and extract representative scenarios
+    
+    Args:
+        use_full_method: Use full paper formulations (slower) or fast approximations
+    """
+    try:
+        full_df = pd.read_csv(file_path)
+        data_df = full_df.drop('Scenario_ID', axis=1)
+        X = data_df.values.astype(float)
+        print("✅ Data loaded successfully.")
+        print(f"Shape of the data: {X.shape[0]} scenarios, {X.shape[1]} components.")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return
+
+    print(f"\n⚙️  Fitting Bernoulli AA (Paper-Aligned) with {k} archetypes...")
+    print(f"Method: {'Full paper formulation' if use_full_method else 'Fast approximation'}")
+
+    best_model = None
+    best_loss = np.inf
+    
+    for i in range(n_init):
+        print(f"\n--- Run {i+1}/{n_init} ---")
+        try:
+            model = AABernoulli_PaperAligned(
+                n_archetypes=k, 
+                random_state=random_seed + i, 
+                max_iter=100,
+                lr=0.005  # Conservative learning rate for stability
+            )
+            model.fit(X, use_full_paper_method=use_full_method)
+            current_loss = model.loss_
+            
+            # Only update if we got a valid loss
+            if np.isfinite(current_loss):
+                print(f"Final loss: {current_loss:.4f}")
+                if current_loss < best_loss:
+                    best_loss = current_loss
+                    best_model = model
+            else:
+                print(f"⚠️  Run failed with non-finite loss")
+        except Exception as e:
+            print(f"⚠️  Run failed with error: {e}")
+            continue
+
+    if best_model is None:
+        print("\n❌ All runs failed. Try:")
+        print("  1. Reducing the number of archetypes")
+        print("  2. Adjusting learning rate (lr parameter)")
+        print("  3. Checking data quality (no all-zero columns)")
+        return None
+
+    print(f"\n✅ Best model selected with loss: {best_loss:.4f}")
+
+    # Extract representative scenarios
+    betas = best_model.betas_
+    chosen_indices = []
+    used = set()
+    
+    for row in betas:
+        sorted_cands = np.argsort(-row)
+        for cand in sorted_cands:
+            if cand not in used:
+                chosen_indices.append(cand)
+                used.add(cand)
+                break
+
+    chosen_scenarios_df = full_df.iloc[chosen_indices].reset_index(drop=True)
+
+    print("\n" + "="*50)
+    print(f"✅ The {k} scenarios chosen by the algorithm are:")
+    print("="*50)
+    for scenario_id in chosen_scenarios_df['Scenario_ID']:
+        print(f"  - {scenario_id}")
+
+    output_filename = f'paper_aligned_scenarios_k{k}.csv'
+    chosen_scenarios_df.to_csv(output_filename, index=False)
+    print(f"\n✅ Saved to '{output_filename}'")
+
+    return chosen_scenarios_df['Scenario_ID'].tolist()
+
+
+if __name__ == '__main__':
+    optimal_k = 30
+    
+    # For speed: use fast approximations (similar to your original)
+    chosen_ids = get_archetype_scenario_ids('damage_matrix.csv', k=optimal_k, use_full_method=False)
+    
+    # For accuracy: use full paper formulations (slower but more faithful)
+    #chosen_ids = get_archetype_scenario_ids('damage_matrix.csv', k=optimal_k, use_full_method=True)
