@@ -1,0 +1,121 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# --- Configuration ---
+OPTIMAL_OBJ_VALUE = 44014.68
+FILE_MAPPING = {
+    'Archetype Analysis': 'aa_aro_results (4).csv',
+    'K-Means': 'kmeans_aro_results (3).csv',
+    'K-Medoids': 'kmedoids_aro_results.csv',
+    'K-Modes': 'kmodes_aro_results.csv',
+    'Monte Carlo': 'montecarlo_aro_results.csv'
+}
+CUSTOM_PALETTE = {
+    'Archetype Analysis': '#1f77b4',
+    'K-Means': '#ff7f0e',
+    'K-Medoids': '#2ca02c',
+    'K-Modes': '#d62728',
+    'Monte Carlo': '#9467bd'
+}
+MARKERS = ['o', 's', '^', 'D', 'X']
+
+def load_data(file_map):
+    all_dfs = []
+    for method, file_path in file_map.items():
+        try:
+            df = pd.read_csv(file_path)
+            df['method'] = method
+            df['optimality_gap'] = ((OPTIMAL_OBJ_VALUE - df['obj_value']) / OPTIMAL_OBJ_VALUE) * 100
+            all_dfs.append(df)
+        except FileNotFoundError:
+            continue
+    return pd.concat(all_dfs, ignore_index=True)
+
+def plot_bounded_grid_minmax(df):
+    plt.rcParams.update({'font.size': 14})
+    plt.figure(figsize=(13, 8))
+    
+    summary = df.groupby(['method', 'k'])['optimality_gap'].agg(['mean', 'min', 'max']).reset_index()
+    unique_k = sorted(df['k'].unique())
+    
+    # Dodging offsets
+    offsets = np.linspace(-1.0, 1.0, len(FILE_MAPPING))
+
+    # Plot Lines & Error Bars
+    for i, method in enumerate(FILE_MAPPING.keys()):
+        method_data = summary[summary['method'] == method]
+        if not method_data.empty:
+            color = CUSTOM_PALETTE[method]
+            y_err = [
+                method_data['mean'] - method_data['min'],
+                method_data['max'] - method_data['mean']
+            ]
+            
+            plt.errorbar(
+                method_data['k'] + offsets[i], 
+                method_data['mean'], 
+                yerr=y_err, 
+                fmt=MARKERS[i] + '-', 
+                label=method, 
+                color=color,
+                capsize=4, 
+                alpha=0.9,      
+                linewidth=1.5,
+                markersize=6,
+                elinewidth=1.5
+            )
+
+    plt.axhline(y=0, color='red', linestyle='--', label='Optimal (0% Gap)')
+    
+    # --- CUSTOM GRID LOGIC ---
+    # We want vertical lines between the K groups.
+    # Assuming uniform spacing of 5 (5, 10, 15...)
+    step = 5
+    # Boundaries start at 2.5 (5 - 2.5) and go up to 52.5 (50 + 2.5)
+    # This places a line exactly halfway between each k group.
+    grid_positions = np.arange(min(unique_k) - step/2, max(unique_k) + step/2 + step, step)
+    
+    # Draw vertical boundary lines
+    for pos in grid_positions:
+        plt.axvline(x=pos, color='gray', linestyle=':', linewidth=1.0, alpha=0.7)
+    
+    # Keep horizontal grid for value readability
+    plt.grid(True, axis='y', linestyle='--', linewidth=0.5, alpha=0.7)
+    
+    # Remove default x-grid to avoid confusion
+    plt.grid(False, axis='x')
+
+    # Styling
+    #plt.title('Optimality Gap Convergence (Bounded Scenarios)', fontsize=20, fontweight='bold', pad=20)
+    plt.xlabel('Number of Scenarios (k)', fontsize=16)
+    plt.ylabel('Average Optimality Gap (%)', fontsize=16)
+    plt.xticks(unique_k)
+    plt.ylim(top=105)
+    
+    # Set X-limits to align with the first and last grid boundary
+    plt.xlim(min(grid_positions), max(grid_positions))
+
+    # Legend
+    plt.legend(
+        title=None,
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=6,
+        fontsize=12,
+        frameon=False,
+        handletextpad=0.5,
+        columnspacing=1.0
+    )
+    
+    plt.subplots_adjust(bottom=0.18)
+    
+    plt.savefig('convergance_plots.pdf', dpi=300)
+    print("Saved Figure: Bounded Grid Min/Max Error Bars")
+    plt.close()
+
+if __name__ == '__main__':
+    sns.set_theme(style="white", context="paper") # Use 'white' to remove default seaborn grid so we control it manually
+    combined_df = load_data(FILE_MAPPING)
+    plot_bounded_grid_minmax(combined_df)
