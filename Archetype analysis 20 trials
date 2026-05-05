@@ -1,0 +1,552 @@
+import numpy as np
+import pandas as pd
+import gurobipy as gp
+from gurobipy import GRB
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import random
+import math
+import os
+from scipy.optimize import nnls, minimize
+
+# ============================================================
+# === ARCHETYPAL ANALYSIS (EXTREME WEIGHTED METHOD) =========
+# ============================================================
+
+def furthest_sum(X, k, random_seed=10):
+    """Furthest sum initialization for diverse starting points"""
+    rng = np.random.RandomState(random_seed)
+    idx = rng.randint(0, X.shape[0])
+    indices = [idx]
+    dists = np.sum(np.abs(X - X[idx]), axis=1)
+    for _ in range(k - 1):
+        idx = np.argmax(dists)
+        indices.append(idx)
+        dists = np.minimum(dists, np.sum(np.abs(X - X[idx]), axis=1))
+    return indices
+
+
+def project_to_simplex(v):
+    """Project vector to simplex (non-negative, sum to 1)"""
+    v = np.maximum(v, 0)
+    v_sum = np.sum(v)
+    
+    if v_sum < 1e-10:
+        return np.ones_like(v) / len(v)
+    
+    result = v / v_sum
+    
+    if not np.isfinite(result).all():
+        return np.ones_like(v) / len(v)
+    
+    return result
+
+
+class AABernoulli_ExtremeWeighted:
+    """
+    Archetypal Analysis with Extreme Weighted C-update
+    Optimized for binary damage scenarios
+    """
+
+    def __init__(self, n_archetypes, max_iter=100, tol=1e-4, random_state=None, 
+                 lr=0.05, epsilon=1e-3, extremeness=4.0):
+        self.n_archetypes = n_archetypes
+        self.max_iter = max_iter
+        self.tol = tol
+        self.lr = lr
+        self.epsilon = epsilon
+        self.extremeness = extremeness  # Controls boundary-seeking behavior
+        self.random_state = np.random.RandomState(random_state)
+
+    def _initialize(self, X):
+        """Initialize alpha, beta, and archetypes Z"""
+        n, p = X.shape
+        k = self.n_archetypes
+
+        # Use furthest sum for diverse initialization
+        indices = furthest_sum(X, k, self.random_state.randint(0, 10000))
+        beta = np.zeros((k, n))
+        for i, idx in enumerate(indices):
+            beta[i, idx] = 1
+
+        # Add small perturbation to avoid exact 0/1
+        self.P = X + self.epsilon - 2 * X * self.epsilon
+        
+        Z = beta @ self.P
+        alpha = np.ones((n, k)) / k
+        return alpha, beta, Z
+
+    def _bernoulli_loss(self, X, R):
+        """Bernoulli loss for binary data"""
+        R = np.clip(R, 1e-10, 1 - 1e-10)
+        return -np.sum(X * np.log(R) + (1 - X) * np.log(1 - R))
+
+    def _s_update_gradient(self, X, Z, alpha):
+        """S-update using gradient descent"""
+        R = alpha @ Z
+        R = np.clip(R, 1e-10, 1 - 1e-10)
+        
+        grad = ((X / R) - ((1 - X) / (1 - R))) @ Z.T
+        
+        if np.any(~np.isfinite(grad)):
+            alpha = alpha + self.random_state.randn(*alpha.shape) * 1e-6
+        else:
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm > 10:
+                grad = grad * (10 / grad_norm)
+            
+            alpha = alpha + self.lr * grad
+        
+        alpha = np.array([project_to_simplex(a) for a in alpha])
+        
+        if np.any(~np.isfinite(alpha)):
+            alpha = np.ones_like(alpha) / alpha.shape[1]
+        
+        return alpha
+
+    def _c_update_extreme_weighted(self, X, alpha):
+        """
+        Extreme Weighted C-update (Boundary-seeking)
+        Uses very high power to push toward single samples
+        
+        extremeness: Higher = closer to single sample (boundary)
+                    3.0-5.0 typical for boundary-seeking
+        """
+        k = self.n_archetypes
+        n = X.shape[0]
+        beta = np.zeros((k, n))
+        
+        for j in range(k):
+            weights = alpha[:, j]
+            
+            # Apply very high power transformation
+            weights_extreme = np.power(weights + 1e-10, self.extremeness)
+            
+            if np.sum(weights_extreme) > 1e-10:
+                beta[j] = weights_extreme / np.sum(weights_extreme)
+            else:
+                # Fallback to max if too extreme
+                max_idx = np.argmax(weights)
+                beta[j, max_idx] = 1.0
+            
+            beta[j] = np.clip(beta[j], 1e-10, 1.0)
+            beta[j] = beta[j] / np.sum(beta[j])
+        
+        Z = beta @ self.P
+        Z = np.clip(Z, self.epsilon, 1 - self.epsilon)
+        
+        return beta, Z
+
+    def fit(self, X):
+        """Fit the model to data"""
+        n, p = X.shape
+        alpha, beta, Z = self._initialize(X)
+        
+        R = alpha @ Z
+        loss = self._bernoulli_loss(X, R)
+        
+        no_improvement_count = 0
+        best_loss = loss
+
+        for it in range(self.max_iter):
+            # S-update: gradient descent
+            alpha = self._s_update_gradient(X, Z, alpha)
+            
+            # C-update: extreme weighted (boundary-seeking)
+            beta, Z = self._c_update_extreme_weighted(X, alpha)
+            
+            R = alpha @ Z
+            new_loss = self._bernoulli_loss(X, R)
+            
+            if not np.isfinite(new_loss):
+                print(f"⚠️  NaN/Inf loss at iteration {it}, stopping")
+                break
+            
+            if abs(loss - new_loss) < self.tol * abs(loss):
+                break
+            
+            if new_loss < best_loss:
+                best_loss = new_loss
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            
+            if no_improvement_count > 20:
+                break
+            
+            loss = new_loss
+
+        self.alphas_ = alpha
+        self.betas_ = beta
+        self.archetypes_ = Z
+        self.loss_ = loss
+        
+        return self
+
+
+def get_archetype_scenario_ids(file_path, k, random_seed=52, n_init=3, extremeness=4.0):
+    """
+    Loads data, fits Archetypal Analysis with Extreme Weighted method,
+    and returns dataframe of chosen representative scenarios.
+    
+    Parameters:
+    -----------
+    extremeness : float
+        Controls boundary-seeking behavior. Higher = more boundary-like.
+        Typical range: 3.0-5.0
+    """
+    try:
+        full_df = pd.read_csv(file_path)
+        data_df = full_df.drop('Scenario_ID', axis=1)
+        X = data_df.values.astype(float)
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
+
+    best_model = None
+    best_loss = np.inf
+    
+    # Run multiple initializations to avoid local optima
+    for i in range(n_init):
+        try:
+            model = AABernoulli_ExtremeWeighted(
+                n_archetypes=k, 
+                random_state=random_seed + i, 
+                max_iter=100,
+                lr=0.005,
+                extremeness=extremeness
+            )
+            model.fit(X)
+            current_loss = model.loss_
+            
+            if np.isfinite(current_loss) and current_loss < best_loss:
+                best_loss = current_loss
+                best_model = model
+        except Exception as e:
+            continue
+
+    if best_model is None:
+        return None
+
+    # Extract scenario indices from beta matrix
+    betas = best_model.betas_
+    chosen_indices = []
+    used = set()
+    
+    for row in betas:
+        sorted_cands = np.argsort(-row)  # Sort by weight (descending)
+        for cand in sorted_cands:
+            if cand not in used:
+                chosen_indices.append(cand)
+                used.add(cand)
+                break
+    
+    # If we couldn't find unique scenarios for all k, fill with random unused
+    if len(chosen_indices) < k:
+        remaining_needed = k - len(chosen_indices)
+        all_indices = list(range(X.shape[0]))
+        unused = set(all_indices) - used
+        if len(unused) >= remaining_needed:
+            chosen_indices.extend(random.sample(list(unused), remaining_needed))
+        else:
+            chosen_indices.extend(list(unused))
+    
+    chosen_scenarios_df = full_df.iloc[chosen_indices].reset_index(drop=True)
+    return chosen_scenarios_df
+
+# ============================================================
+# === ADAPTED ARO MODEL CODE ================================
+# ============================================================
+
+def solve_restoration_model(chosen_scenarios_df, k):
+    """
+    This function formulates and solves the adaptive robust restoration model,
+    featuring tiered, network-specific deadlines for the fairness constraint.
+    """
+    try:
+        # --- 1. Load and Prepare Data ---
+        network_data_sources = {
+            'Power': {'nodes': 'PowerNodes.csv', 'arcs': 'PowerArcs.csv'},
+            'Water': {'nodes': 'WaterNodes.csv', 'arcs': 'WaterArcs.csv'},
+            'Gas': {'nodes': 'GasNodes.csv', 'arcs': 'GasArcs.csv'},
+            'Telecommunication': {'nodes': 'TelecommunicationNodes.csv', 'arcs': 'TelecommunicationArcs.csv'}
+        }
+        
+        network_data = {
+            net: {'nodes': pd.read_csv(files['nodes']), 'arcs': pd.read_csv(files['arcs'])}
+            for net, files in network_data_sources.items()
+        }
+        interdependencies_df = pd.read_csv('Interdep.csv')
+        
+        # Prepare damage matrix from the chosen AA scenarios
+        damage_matrix_df = chosen_scenarios_df.copy()
+        damage_matrix_df['Scenario_ID'] = [f'AA_{k}_{i}' for i in range(len(damage_matrix_df))]
+
+        # --- 2. Define Sets and Parameters ---
+        shift_duration = 8
+        T_max_hours = 168
+        T_max = math.ceil(T_max_hours / shift_duration)
+        T = range(T_max)
+
+        C = []
+        source_nodes = set()
+        arc_to_start_node = {}
+        node_to_incoming_arcs = {}
+        component_map_to_damage_name = {}
+
+        D = {}
+        for net, data in network_data.items():
+            for _, row in data['nodes'].iterrows():
+                comp_id = f'{net}_Node_{row["ID"]}'
+                demand_val = row.get('Demand', 0)
+                if demand_val > 0:
+                    D[comp_id] = demand_val
+        C_d = list(D.keys())
+
+        for net, data in network_data.items():
+            node_to_incoming_arcs[net] = {row['ID']: [] for _, row in data['nodes'].iterrows()}
+            for _, row in data['nodes'].iterrows():
+                comp_id = f'{net}_Node_{row["ID"]}'
+                C.append(comp_id)
+                component_map_to_damage_name[comp_id] = comp_id
+                if comp_id not in D:
+                    source_nodes.add(comp_id)
+
+            for _, row in data['arcs'].iterrows():
+                unique_arc_id = f'{net}_Arc_{row["ID"]}'
+                C.append(unique_arc_id)
+                damage_file_arc_name = f'{net}_Arc_{row["Start Node"]}-{row["End Node"]}'
+                component_map_to_damage_name[unique_arc_id] = damage_file_arc_name
+                start_node_id = f'{net}_Node_{row["Start Node"]}'
+                arc_to_start_node[unique_arc_id] = start_node_id
+                if row['End Node'] in node_to_incoming_arcs[net]:
+                    node_to_incoming_arcs[net][row['End Node']].append(unique_arc_id)
+        
+        dependencies = {}
+        for _, row in interdependencies_df.iterrows():
+            depender_id = f"{row['Depender Network']}_Node_{row['Depender Node']}"
+            dependee_id = f"{row['Dependee Network']}_Node_{row['Dependee Node']}"
+            dependencies[depender_id] = dependee_id
+
+        S = damage_matrix_df['Scenario_ID'].tolist()
+
+        networks = list(network_data_sources.keys())
+        K_crews = [f'{net}_{ctype}_Crew' for net in networks for ctype in ['Node', 'Arc']]
+        
+        N_k = {}
+        for k_c in K_crews:
+            if 'Arc_Crew' in k_c: N_k[k_c] = 5
+            else: N_k[k_c] = 2
+
+        C_ik = {}
+        for c in C:
+            for k_crew in K_crews:
+                comp_net, comp_type, _ = c.split('_', 2)
+                crew_net, crew_type, _ = k_crew.split('_', 2)
+                if comp_net == crew_net and comp_type == crew_type: C_ik[c, k_crew] = 1
+                else: C_ik[c, k_crew] = 0
+
+        r, cost = {}, {}
+        notional_cost_per_hour = 100
+        for net, data in network_data.items():
+            for _, row in data['nodes'].iterrows():
+                comp_id, node_type = f'{net}_Node_{row["ID"]}', str(row.get('Node Type', ''))
+                r_hours = 0
+                if net == 'Gas': r_hours = 48 if 'Gate' in node_type else 12
+                elif net == 'Water': r_hours = 36 if 'Pump' in node_type else 24
+                elif net == 'Power': r_hours = 60 if 'Substation' in node_type else 8
+                elif net == 'Telecommunication': r_hours = 48 if 'Central' in node_type else 16
+                cost[comp_id] = r_hours * notional_cost_per_hour
+                r[comp_id] = math.ceil(r_hours / shift_duration)
+
+            for _, row in data['arcs'].iterrows():
+                comp_id = f'{net}_Arc_{row["ID"]}'
+                length = row['Length (km)']
+                r_hours = 0
+                if net == 'Gas': r_hours = 4 + (2 * length)
+                elif net == 'Water': r_hours = 4 + (1.5 * length)
+                elif net == 'Power': r_hours = 2 + (0.5 * length)
+                elif net == 'Telecommunication': r_hours = 3 + (0.25 * length)
+                cost[comp_id] = r_hours * notional_cost_per_hour
+                r[comp_id] = math.ceil(r_hours / shift_duration)
+        
+        damage_matrix_df.set_index('Scenario_ID', inplace=True)
+        damage_cols = set(damage_matrix_df.columns)
+        delta = {}
+        for c in C:
+            damage_name = component_map_to_damage_name.get(c, c)
+            for s in S:
+                delta[c, s] = damage_matrix_df.loc[s, damage_name] if damage_name in damage_cols else 0
+        
+        delta_max = {c: 1 if any(delta[c, s] == 1 for s in S) else 0 for c in C}
+        P = 1.0
+
+        alpha_fairness = 0.9
+        T_critical_by_network = {
+            'Power': math.ceil(72 / shift_duration),  # Tier 1: 72 hours
+            'Water': math.ceil(72 / shift_duration),  # Tier 1: 72 hours
+            'Gas': math.ceil(96 / shift_duration),    # Tier 2: 96 hours
+            'Telecommunication': math.ceil(96 / shift_duration) # Tier 2: 96 hours
+        }
+
+        try:
+            vulnerable_df = pd.read_csv('vulnerable_nodes.csv')
+            V_vulnerable = {net: set() for net in networks}
+            for _, row in vulnerable_df.iterrows():
+                V_vulnerable[row['Network']].add(row['Vulnerable_ID'])
+        except FileNotFoundError:
+            V_vulnerable = {net: set() for net in networks}
+
+        # --- 3. Build Model ---
+        model = gp.Model("ARO_Restoration_Tiered_Fairness", env=env)
+        model.setParam('OutputFlag', 0)  # Suppress Gurobi output
+
+        x = model.addVars(C, T, K_crews, vtype=GRB.BINARY, name="x")
+        y = model.addVars(C, T, S, vtype=GRB.BINARY, name="y")
+        s_vars = model.addVars(C, T, S, vtype=GRB.BINARY, name="s")
+        U_prime = model.addVars(C_d, T, S, vtype=GRB.CONTINUOUS, lb=0, name="U_prime")
+        eta_prime = model.addVar(vtype=GRB.CONTINUOUS, lb=0, name="eta_prime")
+
+        restoration_cost = gp.quicksum(cost.get(c, 2400) * x[c, t, k_crew] for c in C for t in T for k_crew in K_crews)
+        model.setObjective(restoration_cost + eta_prime, GRB.MINIMIZE)
+
+        # Constraints
+        for s in S:
+            model.addConstr(eta_prime >= gp.quicksum(P * U_prime[c, t, s] for c in C_d for t in T))
+        
+        for c in C:
+            model.addConstr(gp.quicksum(x[c, t, k_crew] for t in T for k_crew in K_crews) <= delta_max.get(c, 0))
+
+        for k_crew in K_crews:
+            for t in T:
+                model.addConstr(gp.quicksum(x[c, tau, k_crew] for c in C for tau in range(max(0, t - int(r.get(c, 3)) + 1), t + 1)) <= N_k[k_crew])
+        
+        for c in C:
+            for t in T:
+                for k_crew in K_crews:
+                    if C_ik[c, k_crew] == 0:
+                        model.addConstr(x[c, t, k_crew] == 0)
+
+        for s in S:
+            for t in T:
+                for c in C:
+                    repair_completed = gp.quicksum(x[c, tau, k_crew] for tau in range(t - int(r.get(c, 3)) + 1) if tau >= 0 for k_crew in K_crews)
+                    model.addConstr(s_vars[c, t, s] <= (1 - delta.get((c,s),0)) + repair_completed)
+                    model.addConstr(y[c, t, s] <= s_vars[c, t, s])
+                
+                for arc, start_node in arc_to_start_node.items():
+                    if arc in y and start_node in y:
+                        model.addConstr(y[arc, t, s] <= y[start_node, t, s])
+
+                for net in network_data.keys():
+                    for node_id_num, incoming_arcs in node_to_incoming_arcs[net].items():
+                        node_id = f"{net}_Node_{node_id_num}"
+                        if node_id not in source_nodes and incoming_arcs:
+                            if node_id in y:
+                                model.addConstr(y[node_id, t, s] <= gp.quicksum(y.get((arc, t, s), 0) for arc in incoming_arcs))
+                
+                for depender, dependee in dependencies.items():
+                    if depender in y and dependee in y:
+                        model.addConstr(y[depender, t, s] <= y[dependee, t, s])
+
+                for c in C_d:
+                    model.addConstr(U_prime[c, t, s] >= D[c] * (1 - y.get((c, t, s), 0)))
+        
+        for net, t_critical in T_critical_by_network.items():
+            vulnerable_subset = V_vulnerable[net]
+            if vulnerable_subset:
+                for s in S:
+                    nodes_restored = gp.quicksum(y[v, t_critical, s] for v in vulnerable_subset if v in D)
+                    required_nodes = alpha_fairness * len([v for v in vulnerable_subset if v in D])
+                    model.addConstr(nodes_restored >= required_nodes, name=f"Fairness_{net}_{s}")
+        
+        model.optimize()
+        
+        if model.status == GRB.OPTIMAL:
+            return model.ObjVal, restoration_cost.getValue(), eta_prime.X
+        else:
+            return np.nan, np.nan, np.nan
+
+    except FileNotFoundError as e:
+        print(f"File not found: {e}")
+        return np.nan, np.nan, np.nan
+    except Exception as e:
+        print(f"Optimization error: {e}")
+        return np.nan, np.nan, np.nan
+
+# ============================================================
+# === EXPERIMENT DRIVER =====================================
+# ============================================================
+
+def run_trial(k, trial, base_seed=42, extremeness=4.0):
+    """Runs a single trial: Fits AA with Extreme Weighted, gets scenarios, runs ARO model."""
+    start_time = time.time()
+    print(f"Starting Trial: k={k}, iter={trial}")
+    
+    # 1. Select Scenarios using Archetypal Analysis (Extreme Weighted)
+    chosen_df = get_archetype_scenario_ids('damage_matrix.csv', k=k, 
+                                          random_seed=base_seed + trial, 
+                                          n_init=1, extremeness=extremeness)
+    
+    if chosen_df is None:
+        return {
+            "k": k,
+            "trial": trial,
+            "obj_value": np.nan,
+            "repair_cost": np.nan,
+            "penalty": np.nan,
+            "runtime": time.time() - start_time
+        }
+    
+    # 2. Solve Restoration Model
+    obj, rest_cost, penalty = solve_restoration_model(chosen_df, k)
+    elapsed = time.time() - start_time
+    
+    print(f"Finished Trial: k={k}, iter={trial} | Obj: {obj}")
+    
+    return {
+        "k": k,
+        "trial": trial,
+        "obj_value": obj,
+        "repair_cost": rest_cost,
+        "penalty": penalty,
+        "runtime": elapsed
+    }
+
+if __name__ == "__main__":
+    k_values = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+    n_trials = 20
+    extremeness = 4.0  # Boundary-seeking parameter (3.0-5.0 recommended)
+    results = []
+
+    # ProcessPoolExecutor for parallel execution
+    # Note: Gurobi limits parallel processes based on license type.
+    # If using a single-use license, reduce max_workers to 1.
+    with ProcessPoolExecutor() as executor:
+        futures = []
+        for k in k_values:
+            for trial in range(n_trials):
+                futures.append(executor.submit(run_trial, k, trial, extremeness=extremeness))
+        
+        for f in as_completed(futures):
+            results.append(f.result())
+
+    # Save detailed results
+    df_results = pd.DataFrame(results)
+    df_results.to_csv("aa_aro_results.csv", index=False)
+
+    # Compute and print summary
+    def count_valid(group):
+        return group['obj_value'].notna().sum()
+
+    summary = df_results.groupby("k").agg({
+        "obj_value": ["mean", "std", "min", "max"],
+        "repair_cost": ["mean", "std"],
+        "penalty": ["mean", "std"],
+        "runtime": "mean"
+    })
+    summary[('obj_value', 'num_valid')] = df_results.groupby("k").apply(lambda g: count_valid(g))
+    
+    print("\n=== Experiment Summary ===")
+    print(summary)
+    summary.to_csv("aa_aro_summary.csv")
